@@ -1,0 +1,1481 @@
+---
+title: "Cosa guida il voto? Un’analisi dei risultati referendari tra demografia e storia elettorale"
+subtitle: "Report di Data Mining"
+author: "Luca Oggioni, Filippo Valente, Enrico Pedol"
+date: "Aprile 2026"
+output:
+  html_document:
+    theme: flatly
+    toc: true
+    toc_float: true
+    code_folding: show
+  pdf_document:
+    toc: true
+editor_options:
+  markdown:
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.width=10, fig.height=7)
+
+library(mice)
+library(lattice)
+library("visdat")
+library("naniar")
+library("UpSetR")
+library(ggplot2)
+library(GGally)
+library(ggcorrplot)
+library(ggrepel)
+library(tidyverse)
+library(sf)
+library(mapview)
+library(leafpop)
+library(VIM)
+
+f11 <- read.csv("f11.csv")
+```
+
+# 1. Introduzione
+
+Il report documenta le fasi di analisi esplorativa, pulizia dei dati e
+modellazione predittiva sviluppate per indagare il comportamento
+elettorale e referendario in Italia in occasione del Referendum sulla
+separazione delle carriere del 22 e 23 aprile. L'obiettivo di fondo è
+capire in che misura caratteristiche socio-demografiche e geografiche
+riescano a spiegare le scelte di voto a livello comunale.
+
+La domanda di ricerca che ci siamo posti è: **Da cosa viene guidato il
+voto per comune?**
+
+Il progetto si articola in quattro moduli:
+
+-   **Costruzione del Dataset e Data Quality**: integrazione di dati
+    anagrafici (ISTAT), geografici e risultati storici (Eligendo), con
+    imputazione dei valori mancanti tramite MICE.
+-   **Analisi Esplorativa (EDA)**: visualizzazioni, matrici di
+    correlazione e individuazione di anomalie a livello comunale.
+-   **Modellistica Parametrica**: confronto tra Regressione Logistica
+    classica, LASSO, Relaxed LASSO e Post-LASSO per la previsione
+    dell'esito binario (vittoria del SÌ o del NO).
+-   **Modellistica Non Parametrica ed Ensemble**: Decision Tree, Random
+    Forest e un modello surrogato globale per garantire spiegabilità
+    (XAI).
+
+------------------------------------------------------------------------
+
+# 2. Analisi Esplorativa-Descrittiva
+
+## 2.1 Legenda delle Variabili
+
+Il dataset è stato costruito unendo i dati demografici ISTAT (riferiti
+al 1° gennaio 2026) con i risultati elettorali Eligendo delle Elezioni
+Politiche del 2022 e del Referendum 2025, più i risultati del Referendum
+22-23 marzo 2026. Per quest'ultimo, in virtù della mancata pubblicazione
+dei tabulati definitivi in formato strutturato, i dati sono stati
+estratti interrogando le **REST API interne** del portale ministeriale
+(`eleapi.interno.gov.it`), tramite lo script open-source del ricercatore
+**Lorenzo Ruffino**
+([\@Ruffino_Lorenzo](https://x.com/Ruffino_Lorenzo)), reso disponibile
+sul suo [repository GitHub](https://github.com/lorenzo-ruffino). Questo
+processo di *API scraping* ha permesso di ottenere i dati elettorali in
+un formato nativamente strutturato, superando i limiti della sola
+dashboard grafica ministeriale.
+
+Di seguito il dizionario delle variabili:
+
+-   **Struttura base**:
+    -   `COMUNE`: Nome del comune
+    -   `CODICE_COMUNE`: Codice numerico ISTAT
+    -   `POSIZIONE_GEO`: 3 livelli (Nord, Centro, Sud)
+-   **Geometria e Demografia**:
+    -   `ETA_MEDIA`: Età media della popolazione
+    -   `PERC_MASCHILE`: Quota di residenti di sesso maschile
+    -   `POPOLAZIONE`: Numero totale dei residenti
+    -   `PERC_STRANIERI`: Quota di residenti di altra nazionalità
+    -   `SUPERFICIE_kmq`: Superficie in km²
+    -   `DENSITA_Xkmq`: `POPOLAZIONE`/`SUPERFICIE_kmq`
+    -   `FASCIA_POPOLAZIONE`: 4 livelli — "Micro" (\<2.500 ab.),
+        "Piccolo" (2.500–5.000), "Medio" (5.000–15.000), "Grande"
+        (\>15.000).
+-   **Istruzione**:
+    -   `BASSA_ISTR`: Quota di residenti con al massimo la licenza media
+    -   `MEDIA_ISTR`: Quota intermedia (= 1 − `ALTA_ISTR` −
+        `BASSA_ISTR`)
+    -   `ALTA_ISTR`: Quota di residenti con titolo terziario di secondo
+        livello o superiore
+-   **Reddito (Indici PCA)**: *Le tre variabili seguenti derivano da
+    un'Analisi delle Componenti Principali applicata al set originario
+    di fasce di reddito IRPEF (`REDDITO_MEDIO_0K_10K` fino a
+    `REDDITO_MEDIO_120K_EPIU`). La PCA è stata adottata per risolvere il
+    problema della quasi-perfetta multicollinearità tra queste fasce, le
+    prime tre componenti estratte spiegano complessivamente il 62,6%
+    della varianza originaria: un compromesso metodologico che sacrifica
+    una quota di informazione per ottenere tre indicatori
+    macro-economici stabili e ortogonali tra loro:*
+    -   `INDICE_POVERTA` (PC1): Cattura la diffusa assenza di redditi
+        medi e alti, valori alti segnalano comuni dove la concentrazione
+        di redditi bassi è strutturalmente dominante.
+    -   `INDICE_DISUGUAGLIANZA` (PC2): Misura la polarizzazione nella
+        distribuzione del reddito, valori alti indicano comuni con una
+        marcata coesistenza di fasce molto povere e molto ricche, senza
+        un ceto medio robusto.
+    -   `INDICE_CETO_MEDIO` (PC3): Cattura la solidità della classe
+        media, valori alti segnalano comuni dove i redditi da fascia
+        intermedia sono ben rappresentati rispetto ai due estremi.
+
+> *(A seguire, l'output R che ha guidato l'interpretazione dei
+> loadings):*
+
+```{r pca_loadings, eval=FALSE}
+# Ispezione dei Pesi sulle specifiche fasce di reddito IRPEF
+> print(pca_reddito$rotation[, 1:3])
+##                              PC1         PC2         PC3
+## REDDITO_MEDIO_120K_EPIU -0.43463274  0.41644053 -0.2282871
+## REDDITO_MEDIO_75K_120K  -0.52280330  0.24595306 -0.1549522
+## REDDITO_MEDIO_55K_75K   -0.50972921  0.07646648 -0.0846835
+## REDDITO_MEDIO_26K_55K   -0.32540050 -0.29532947  0.4005685
+## REDDITO_MEDIO_15K_26K   -0.29158911 -0.51228276  0.3516178
+## REDDITO_MEDIO_10K_15K   -0.28822696 -0.45597452 -0.2009570
+## REDDITO_MEDIO_0K_10K     0.06295031 -0.45019038 -0.7695646
+
+> summary(pca_reddito)$importance[3, 3] * 100
+## 62.596
+```
+
+-   **Componente Elettorale**:
+    -   `PERC_SI_EL22`: Percentuale aggregata di voti alle Elezioni 2022
+        ai partiti favorevoli al SÌ (gli *NA* corrispondono a partiti
+        non posizionati o non presenti nel comune).
+    -   `PERC_SI_CITTAD_REF25`: Percentuale di SÌ al 5° quesito del
+        Referendum Cittadinanza 2025 (dimezzamento da 10 a 5 anni del
+        periodo di residenza legale richiesto per la cittadinanza).
+    -   `PERC_SI`: Percentuale di SÌ al Referendum del 22-23 marzo 2026.
+    -   `SI_NO`: Variabile risposta binaria (esito comunale: SÌ o NO).
+
+------------------------------------------------------------------------
+
+## 2.2 Analisi Esplorativa e Matrice di Correlazione
+
+Prima di qualsiasi modellazione, la matrice di correlazione serve a
+farsi un'idea di dove si concentra il segnale utile. Si escludono le
+variabili identificative e i target categorici.
+
+```{r correlograma, fig.cap="Matrice di Correlazione delle variabili indipendenti rispetto al target"}
+x <- f11[, -c(1, 2, 12, 13, 14)] # Rimozione features
+
+ggcorrplot(cor(x[, -c(9,15,16)], use = "pairwise.complete.obs"), 
+           method = "square", 
+           type = "lower",        
+           lab = TRUE, 
+           lab_size = 2.5,        
+           tl.cex = 10,           
+           tl.srt = 45,           
+           colors = c("blue", "white", "red"),
+           title = "Matrice di Correlazione",
+           ggtheme = theme_minimal())
+```
+
+> **Osservazione**: Il predittore con la correlazione più alta rispetto
+> alla variabile risposta quantitativa (`PERC_SI`) è `PERC_SI_EL22`,
+> ovvero il comportamento di voto storico. Il messaggio è chiaro: i
+> comuni che nel 2022 hanno votato partiti favorevoli al SÌ tendono a
+> riproporre lo stesso orientamento nel 2026. Si tratta di inerzia
+> elettorale, un fenomeno ben documentato in letteratura e che qui si
+> manifesta con una solidità notevole. Le variabili demografiche, pur
+> correlate tra loro, mostrano segnali più deboli verso il target il che
+> anticipa già che il loro contributo predittivo sarà reale ma
+> secondario rispetto alla storia politica del territorio.
+
+------------------------------------------------------------------------
+
+## 2.3 Analisi dei Dati Mancanti
+
+La copertura elettorale non è garantita per tutti i comuni: un partito
+che nel 2022 non era presente in una data area, o che non aveva preso
+una posizione esplicita sul quesito referendario, genera automaticamente
+un valore mancante in `PERC_SI_EL22`. È quindi un problema strutturale,
+non un difetto di raccolta dati.
+
+```{r missing_upset, fig.cap="Intersezioni dei dati mancanti"}
+upset(as_shadow_upset(x))
+```
+
+> **Tipologia di mancanza**: L'UpSet plot e la mappa spaziale mostrano
+> che i missing non sono distribuiti a caso tra i comuni (il che esclude
+> l'ipotesi MCAR). Sono invece concentrati in Trentino-Alto Adige e
+> Valle d'Aosta regioni dove la struttura dell'offerta politica è
+> storicamente diversa da quella nazionale. Dal punto di vista
+> statistico, questa è una situazione di **MAR (Missing At Random)**: la
+> probabilità che un dato manchi è interamente spiegabile dalla
+> posizione geografica del comune, una variabile presente nel dataset.
+> Questa distinzione non è solo accademica: se i missing fossero MCAR
+> potremmo semplicemente ignorarli; essendo MAR, ignorarli
+> significherebbe introdurre un sistematico bias geografico nelle
+> analisi successive.
+
+### Localizzazione Spaziale dei Missing Value
+
+```{r mappa_na, message=FALSE, warning=FALSE, out.width="100%"}
+
+mappa_comuni <- st_read("Com01012026_WGS84.shp", quiet = TRUE)
+
+mappa_comuni2 <- mappa_comuni %>% mutate(Nome_Match = str_to_upper(str_trim(COMUNE)))
+f11.2 <- f11 %>% mutate(Nome_Match = str_to_upper(str_trim(COMUNE))) 
+
+mappa_dati <- left_join(mappa_comuni2, f11.2, by = "Nome_Match")
+mappa_controllo_na <- mappa_dati %>%
+  mutate(Stato_Dato = ifelse(is.na(PERC_SI_EL22), "NA", "Presente"))
+
+library(ggplot2)
+
+ggplot(mappa_controllo_na) +
+  geom_sf(aes(fill = Stato_Dato), color = NA) +
+  scale_fill_manual(
+    values = c("NA" = "red", "Presente" = "lightgray"),
+    labels = c("Dati Mancanti (NA)", "Dati Presenti")
+  ) +
+  theme_void() + 
+  labs(
+    title = "Localizzazione Geografica dei Dati Mancanti",
+    subtitle = "Assenza dei tabulati per le Elezioni Politiche 2022",
+    fill = ""
+  ) +
+  theme(legend.position = "bottom")
+```
+
+*(La cartografia conferma visivamente che la quasi totalità dei comuni
+"rossi" è concentrata nelle due province indagate.)*
+
+### Distribuzione condizionata dei Missing Data
+
+```{r marginplot, fig.cap="Marginplot: Relazione tra il Target Referendario e gli NA Storici"}
+marginplot(f11[c(15,6)])
+
+pMiss <- function(x){sum(is.na(x))/length(x)*100}
+apply(f11, 2, pMiss)
+```
+
+> **Riscontro statistico (Marginplot)**: I 384 comuni con `PERC_SI_EL22`
+> mancante mostrano una distribuzione di `PERC_SI` (il target
+> referendario 2026) quasi sovrapponibile a quella dei comuni con il
+> dato presente il boxplot rosso e quello azzurro sull'asse X si
+> discostano solo marginalmente. I comuni "settentrionali speciali" non
+> votano in modo radicalmente diverso dagli altri comuni del Nord.
+> L'imputazione si concentrerà quindi su `PERC_SI_EL22` (\~5% di missing
+> rate), mentre per le altre variabili il tasso di mancanza è
+> trascurabile (\<0.75%).
+
+------------------------------------------------------------------------
+
+## 2.4 Dinamiche di Voto e Spostamenti Demografici
+
+Il quadrante politico che segue disperde i comuni mettendo in relazione
+il voto storico del 2022 con quello referendario del 2026, con
+dimensione proporzionale alla popolazione.
+
+```{r dispersione_voti, fig.width=12, fig.height=8}
+ggplot(f11, aes(x = PERC_SI, y = PERC_SI_EL22)) +
+  annotate("rect", xmin = -Inf, xmax = 0.5, ymin = -Inf, ymax = 0.5, fill = "#82E0AA", alpha = 0.4) + 
+  annotate("rect", xmin = 0.5, xmax = Inf, ymin = -Inf, ymax = 0.5, fill = "#D2B4DE", alpha = 0.4) +  
+  annotate("rect", xmin = -Inf, xmax = 0.5, ymin = 0.5, ymax = Inf, fill = "#F1948A", alpha = 0.4) +  
+  annotate("rect", xmin = 0.5, xmax = Inf, ymin = 0.5, ymax = Inf, fill = "#85C1E9", alpha = 0.4) +   
+  geom_vline(xintercept = 0.5, color = "black", linewidth = 0.3, linetype = "dashed") +
+  geom_hline(yintercept = 0.5, color = "black", linewidth = 0.3, linetype = "dashed") +
+  geom_miss_point(aes(size = POPOLAZIONE), alpha = 0.5) +
+  geom_text_repel(
+    data = subset(f11, POPOLAZIONE > 200000),
+    aes(label = COMUNE),
+    size = 4.0, colour = "red", fontface = "bold", max.overlaps = Inf, box.padding = 0.6
+  ) +
+  scale_size_area(max_size = 12, labels = scales::comma) +
+  guides(
+    size = guide_legend(override.aes = list(color = "#00BFC4", alpha = 0.5)),
+    color = guide_legend(override.aes = list(size = 4)) 
+  ) +
+  theme_minimal() +
+  labs(
+    title = "Dispersione dei voti e Dati Elettorali Mancanti",
+    subtitle = "Evidenza sui quadranti per comuni con più di 200.000 residenti",
+    x = "Percentuale SÌ referendum 2026",
+    y = "Percentuale SÌ partiti elezioni 2022",
+    size = "Popolazione",        
+    color = "Dato Elettorale"    
+  ) +
+  theme(legend.background = element_rect(fill = "white", color = NA, alpha = 0.8))
+```
+
+### Sintesi: cosa racconta il quadrante politico
+
+La nuvola di punti si dispone prevalentemente lungo la diagonale, a
+confermare che i comuni del 2026 votano in buona misura come nel 2022
+con una differenza importante: la nuvola è traslata verso sinistra
+rispetto alla bisettrice. Significa che, a parità di orientamento
+storico, il referendum ha raccolto meno SÌ di quanti i partiti ne
+avessero "promessi". Il NO ha sovraperformato rispetto alle aspettative
+implicite del voto politico.
+
+1.  **Quadrante in Basso a Sinistra (Verde)** — *Stabilità sul NO*: qui
+    si concentrano le roccaforti tradizionalmente orientate al NO
+    (Bologna, Firenze), ma anche le metropoli del Sud (Napoli, Palermo,
+    Catania, Bari) e Genova. Il fatto che molte delle città più popolose
+    ricadano in questo quadrante spiega in larga parte la vittoria del
+    NO a livello nazionale.
+
+2.  **Quadrante in Basso a Destra (Viola)** — *Inversione verso il NO*:
+    è il quadrante quasi vuoto. Quasi nessun comune orientato
+    storicamente al NO si è ribaltato verso il SÌ nel 2026, nemmeno tra
+    i piccoli. L'assenza di punti qui riflette direttamente la sconfitta
+    del SÌ.
+
+3.  **Quadrante in Alto a Destra (Azzurro)** — *Stabilità sul SÌ*:
+    sostanzialmente deserto nelle grandi città Verona è l'unica presenza
+    significativa, e si trova molto vicina alla soglia del 50%.
+
+4.  **Quadrante in Alto a Sinistra (Rosso)** — *Inversione verso il NO*:
+    è il quadrante più interessante dal punto di vista interpretativo.
+    Milano, Padova, Venezia, Roma tutte città "indirizzate" al SÌ dal
+    voto politico del 2022; nel 2026 si sono fermate sotto il 50%.
+    Torino spicca per la posizione particolarmente a sinistra nel
+    grafico: una delle inversioni più nette tra i grandi centri urbani.
+
+------------------------------------------------------------------------
+
+## 2.5 Modellazione Diagnostica: Cattura degli Outlier
+
+Una regressione lineare su `PERC_SI` serve qui come strumento
+diagnostico, non predittivo. Il modello lineare ammette valori fuori
+dall'intervallo [0,1], ma quello che ci interessa non è la previsione in
+sé, bensì i residui: i comuni che si comportano in modo sistematicamente
+diverso da come le loro covariate lascerebbero attendersi.
+
+```{r diagnostic_model, results='hide'}
+f11_completo <- f11 %>% drop_na()
+
+modello <- lm(PERC_SI ~ PERC_MASCHILE + PERC_SI_EL22 + SUPERFICIE_kmq + INDICE_DISUGUAGLIANZA + 
+              PERC_SI_CITTAD_REF25 + POSIZIONE_GEO + DENSITA_Xkmq + FASCIA_POPOLAZIONE, 
+              data = f11_completo[, -c(1, 2, 12, 13, 14)], 
+              na.action = na.exclude)
+summary(modello)
+```
+
+### Anomalia Statistica (Residui Studentizzati)
+
+I residui studentizzati identificano i comuni che si discostano dalla
+norma regressiva. Si fissa una soglia cromatica a \|3\| e una soglia di
+etichettatura a \|5\| quest'ultima per distinguere le anomalie estreme.
+
+```{r outlier_plot}
+f11_outlier <- f11_completo %>%
+  mutate(
+    Residui = rstudent(modello),
+    E_Outlier = ifelse(abs(Residui) > 3, "Sì", "No") 
+  )
+
+ggplot(f11_outlier, aes(x = PERC_SI, y = PERC_SI_EL22)) +
+  geom_point(aes(color = E_Outlier, size = POPOLAZIONE), alpha = 0.5) +
+  scale_color_manual(values = c("No" = "lightgrey", "Sì" = "red")) +
+  geom_text_repel(
+    data = subset(f11_outlier, abs(Residui) > 5), 
+    aes(label = COMUNE), 
+    size = 4, color = "darkred", box.padding = 0.5, max.overlaps = Inf 
+  ) +
+  scale_size_continuous(range = c(1, 8), guide = "none") + 
+  theme_minimal() +
+  labs(
+    title = "Identificazione Statistica degli Outlier",
+    subtitle = "In rosso l'anomalia statistica (res > 3), con etichette per i casi estremi (res > 5)",
+    x = "Percentuale SÌ referendum 2026",
+    y = "Percentuale SÌ partiti elezioni 2022",
+    color = "Outlier?"
+  ) +
+  theme(legend.position = "bottom")
+```
+
+> **L'effetto micro-comune**: I punti rossi estremi hanno tutti
+> dimensioni molto piccole nel grafico (e diametri minuscoli in termini
+> di popolazione). È un fenomeno noto: nei comuni con poche centinaia di
+> elettori, uno spostamento di una manciata di voti produce variazioni
+> percentuali enormi. Briga Alta, Curiglia e gli altri comuni alpini
+> etichettati sono casi dove probabilmente dinamiche locali molto
+> specifiche un sindaco, un'ondata demografica, un'emigrazione
+> stagionale hanno completamente sovvertito il quadro atteso dalle
+> statistiche. All'opposto, comuni come Africo e Celle di San Vito
+> mostrano tassi di SÌ alti rispetto a quanto ci si aspettava.
+
+### Comuni Influenti (Distanza di Cook)
+
+L'outlier e il punto di leva sono concetti distinti. Un comune può
+deviare fortemente dalla norma statistica (outlier) senza influenzare i
+coefficienti del modello, oppure può avere covariate estreme (leva) e
+per questo attirare su di sé l'intera retta di regressione, anche
+votando "come previsto".
+
+```{r cook_distance_plot, fig.height=6}
+f11_cook <- f11_outlier %>% 
+  mutate(Cooks_D = cooks.distance(modello), Indice = row_number())
+
+soglia_cook <- 4 / nrow(f11_cook)
+top_estremisti_cook <- f11_cook %>% arrange(desc(Cooks_D)) %>% head(10)
+
+ggplot(f11_cook, aes(x = Indice, y = Cooks_D)) +
+  geom_hline(yintercept = soglia_cook, color = "darkred", linetype = "dashed", alpha = 0.5) +
+  geom_segment(aes(xend = Indice, yend = 0, color = Cooks_D > soglia_cook), alpha = 0.5) +
+  geom_point(aes(color = Cooks_D > soglia_cook, size = Cooks_D > soglia_cook), alpha = 0.8) +
+  scale_color_manual(values = c("FALSE" = "lightgray", "TRUE" = "red")) +
+  scale_size_manual(values = c("FALSE" = 1.0, "TRUE" = 2.0)) + 
+  geom_text_repel(
+    data = top_estremisti_cook, 
+    aes(label = COMUNE),
+    size = 3.8, color = "darkred", fontface = "bold", box.padding = 0.8, 
+    min.segment.length = 0, max.overlaps = Inf
+  ) +
+  theme_minimal() +
+  labs(
+    title = "Outlier Influenziali: Distanza di Cook (Lollipop Chart)",
+    subtitle = paste("Soglia (linea): 4/N. Etichette limitate ai Top Influencer."),
+    x = "Indice", y = "Valore di Distanza"
+  ) + theme(legend.position = "none")
+```
+
+> **Nota su Roma (leva vs. outlier)**: Roma è il caso più istruttivo.
+> Come grande città con covariate demografiche ed economiche estreme
+> rispetto alla media dei 7.000 comuni italiani, Roma possiede una forza
+> gravitazionale sul modello: se votasse diversamente da come il modello
+> si aspetta, sposterebbe i coefficienti nazionali in modo non
+> trascurabile. Il punto è che Roma *non* vota diversamente il suo
+> residuo è piccolo. Questo la distingue nettamente dai micro-comuni del
+> Nord etichettati come outlier: lì il residuo è grande, ma il peso
+> demografico è talmente esiguo da non disturbare il modello globale. I
+> casi davvero problematici sarebbero grandi città con residui elevati
+> una combinazione che nel dataset non si presenta.
+
+------------------------------------------------------------------------
+
+## 2.6 MICE Imputation Data & Data Scaling
+
+Per evitare il data leakage, il dataset viene diviso in training (75%) e
+test (25%) prima di qualsiasi imputazione. Il modello MICE viene stimato
+sul solo training set, poi applicato al test set tramite `mice.mids`
+(funzione che permette di applicare un modello di imputazione già
+calcolato a un nuovo dataset).
+
+```{r mice_imputation, results='hide'}
+x <- f11[, -c(1, 2, 12, 13, 15, 20, 21)]
+
+set.seed(100)
+id_TR <- sample(1:nrow(x), nrow(x)*0.75)
+
+TRAINING.set <- x[id_TR, ]
+TEST.set     <- x[-id_TR, ]
+
+p <- dim(TRAINING.set)[2]
+my_predictorMatrix <- 1 - diag(nrow = p, ncol = p)
+my_predictorMatrix[, 10] <- 0 
+
+impTRAINING <- mice(TRAINING.set, method = "pmm", predictorMatrix = my_predictorMatrix, 
+                    seed = 100, m = 5, maxit = 10, printFlag = FALSE)
+
+impTEST <- mice.mids(impTRAINING, newdata = TEST.set)
+
+# ESTRAZIONE DAI MODELLI MICE
+
+df_train_imputato <- complete(impTRAINING, 1)
+df_test_imputato  <- complete(impTEST, 1)
+
+# REINSERIMENTO DELLE VARIABILI TOLTE IN PRECEDENZA
+
+colonne_tolte_TR <- f11[id_TR,  c(1,2,20,21)]
+colonne_tolte_TE <- f11[-id_TR, c(1,2,20,21)]
+
+df_train <- cbind(df_train_imputato, colonne_tolte_TR)
+df_test  <- cbind(df_test_imputato, colonne_tolte_TE)
+
+# AGGIUNTA VARIABILI TRASFORMATE
+df_train$LOG_POPOLAZIONE <- log(df_train$POPOLAZIONE + 1)
+df_test$LOG_POPOLAZIONE  <- log(df_test$POPOLAZIONE + 1)
+
+df_train$LOG_DENSITA <- log(df_train$DENSITA_Xkmq + 1)
+df_test$LOG_DENSITA  <- log(df_test$DENSITA_Xkmq + 1)
+
+df_train$LOG_SUPERFICIE <- log(df_train$SUPERFICIE_kmq + 1)
+df_test$LOG_SUPERFICIE  <- log(df_test$SUPERFICIE_kmq + 1)
+
+# NORMALIZZAZIONE (MIN-MAX: Raggio 0 - 1)
+
+col_numeriche <- names(df_train)[sapply(df_train, is.numeric)]
+
+da_non_scalare <- c("CODICE_COMUNE") 
+col_da_scalare <- setdiff(col_numeriche, da_non_scalare)
+
+minimi_TRAIN  <- apply(df_train[, col_da_scalare], 2, min, na.rm = TRUE)
+massimi_TRAIN <- apply(df_train[, col_da_scalare], 2, max, na.rm = TRUE)
+
+TRAIN_FINALE <- df_train
+TEST_FINALE  <- df_test
+
+for(col in col_da_scalare) {
+  
+  TRAIN_FINALE[[col]] <- (df_train[[col]] - minimi_TRAIN[col]) / 
+    (massimi_TRAIN[col] - minimi_TRAIN[col])
+  
+  # MINIMO E MASSIMO IMPARATI DAL TRAIN
+  TEST_FINALE[[col]]  <- (df_test[[col]]  - minimi_TRAIN[col]) / 
+    (massimi_TRAIN[col] - minimi_TRAIN[col])
+}
+
+TRAIN_FINALE <- TRAIN_FINALE %>% select(COMUNE, CODICE_COMUNE, everything())
+TEST_FINALE <- TEST_FINALE %>% select(COMUNE, CODICE_COMUNE, everything())
+
+write.csv(TRAIN_FINALE, file = "TRAINING.SET.csv", row.names = FALSE)
+write.csv(TEST_FINALE, file = "TEST.SET.csv", row.names = FALSE)
+```
+
+> **Giustificazione Metodologica sulla Data Scaling**
+>
+> Per garantire omogeneità dimensionale ai successivi algoritmi di
+> Machine Learning, l'intero blocco di predittori numerici è stato
+> scalato all'interno di un raggio standard $[0, 1]$ tramite **Min-Max
+> Scaling**. Contrariamente all'impiego della Standardizzazione, si è
+> optato per il Min-Max per: mantenere geometricamente inalterate le
+> proporzioni di dispersione originali e non forzare la varianza ad
+> assumere un profilo inesistente nel mondo reale. Parallelamente, per
+> attenuare l'eteroschedasticità di variabili territoriali soggette a
+> divari strutturali (come la `Densità Abitativa` o la `Popolazione`),
+> prima dello scaling sono state calcolate trasformazioni Logaritmiche
+> ($log(X+1)$). Infine, **per evitare Data Leakage**, la mappatura dei
+> pesi e dei limiti (i vettori dei `MIN` e `MAX`) è stata "imparata"
+> esclusivamente sul set di Training, per poi essere proiettata e
+> applicata sui vettori del set di Test.
+
+I grafici diagnostici che seguono vengono generati sul test set. La
+logica è quella di valutare la capacità di generalizzazione del modello
+di imputazione su dati che non ha mai visto in fase di stima esattamente
+come si farebbe con qualsiasi altro modello predittivo.
+
+```{r strip_imputazione, fig.width=10, fig.height=5}
+stripplot(impTEST, PERC_SI_EL22 ~ .imp, 
+          pch = 20,          
+          ylab = "Percentuale partiti SÌ (Elezioni 2022)", 
+          xlab = "Set di Dati (1 = Originali, 2-6 = Imputazioni MICE)",
+          main = "Stripplot Imputazione (TEST SET Inedito)")
+```
+
+> **Diagnostica Stripplot**: I valori imputati nei set 2-6 ricadono
+> all'interno del range empirico dei dati originali (set 1), senza
+> sfondare i limiti superiori o inferiori della distribuzione.
+> L'imputazione non sta inventando valori improbabili: si comporta come
+> un buon interpolatore che conosce il contesto geografico dei comuni
+> mancanti.
+
+```{r density_imputazione, fig.width=10, fig.height=5}
+densityplot(impTEST, ~ PERC_SI_EL22, 
+            main = "Curve di Densità delle Imputazioni (TEST SET Inedito)", 
+            ylab = "Densità", xlab = "Percentuale partiti SÌ")
+```
+
+> **Diagnostica Densityplot**: Le cinque curve rosse (imputazioni PMM)
+> si sovrappongono bene alla curva originale blu. Si nota un lieve
+> spostamento verso destra rispetto ai dati osservati, ovvero le
+> imputazioni sono mediamente più favorevoli al SÌ, coerente col fatto
+> che i comuni con dato mancante sono prevalentemente settentrionali,
+> storicamente più orientati verso il SÌ.
+>
+> **Nota Metodologica sull'Estrazione Singola (m=1)**: Osservando sia lo
+> *Stripplot* che il *Densityplot*, si evince come le 5 curve (e nuvole
+> di punti) imputate risultino sovrapponibili fra loro. Questa stretta
+> convergenza visiva dimostra empiricamente che la "Varianza
+> Between-Imputations" (ovvero l'incertezza del modello MICE tra
+> un'iterazione e l'altra) è prossima allo zero. Poiché l'algoritmo PMM
+> si è rivelato coerente e stabile nel ricostruire i dati mancanti in
+> quel circoscritto 5% geografico, si deduce che lavorare con
+> l'imputazione numero 1, la 3 o la 5 avrebbe generato matrici
+> statisticamente indistinguibili. Optare per una singola estrazione su
+> base PMM ci ha dunque consentito di impiegare MICE come stimatore
+> predittivo.
+
+------------------------------------------------------------------------
+
+# 3. Modelli Parametrici
+
+```{r setup_param, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.align = "center")
+```
+
+## 3.1 Preparazione dei Dati
+
+Prima di stimare i modelli vengono rimosse le variabili strettamente
+politiche o elettorali (`PERC_SI_EL22` e `PERC_SI_CITTAD_REF25`). Questo
+viene fatto per una ragione metodologica precisa, includerle, infatti,
+produrrebbe un'accuracy prossima al 99%, ma il risultato sarebbe privo
+di contenuto informativo: predire un esito elettorale usando
+comportamenti elettorali pregressi equivale a predire il voto con il
+voto. Il loro potere predittivo è quasi-identitario rispetto al target,
+non strutturale e oscurerebbe completamente il contributo delle
+variabili demografiche, che è invece l'oggetto di interesse di questa
+fase. L'obiettivo qui è capire quanto spieghino le sole caratteristiche
+intrinseche del comune. Le variabili politiche vengono reintrodotte
+nella Sezione 4, dove il loro contributo marginale rispetto al profilo
+demografico puro verrà misurato esplicitamente.
+
+```{r data_loading, include=FALSE}
+dataset_train <- read.csv("TRAINING.SET.csv")
+dataset_test  <- read.csv("TEST.SET.csv")
+```
+
+```{r data_prep, include=FALSE}
+data <- dataset_train
+test <- dataset_test
+
+set.seed(100)
+
+data$POSIZIONE_GEO     <- as.factor(data$POSIZIONE_GEO)
+data$SI_NO             <- as.factor(data$SI_NO)
+data$FASCIA_POPOLAZIONE <- as.factor(data$FASCIA_POPOLAZIONE)
+
+test$POSIZIONE_GEO     <- as.factor(test$POSIZIONE_GEO)
+test$SI_NO             <- as.factor(test$SI_NO)
+test$FASCIA_POPOLAZIONE <- as.factor(test$FASCIA_POPOLAZIONE)
+
+rownames(data) <- data$CODICE_COMUNE
+rownames(test) <- test$CODICE_COMUNE
+
+data$COMUNE        <- NULL
+test$COMUNE        <- NULL
+data$CODICE_COMUNE <- NULL
+test$CODICE_COMUNE <- NULL
+
+data$PERC_SI_EL22          <- NULL
+data$PERC_SI_CITTAD_REF25  <- NULL
+test$PERC_SI_EL22          <- NULL
+test$PERC_SI_CITTAD_REF25  <- NULL
+```
+
+La funzione `calc_metrics` calcola le metriche di performance standard
+(Accuracy, Sensitivity, Specificity, Precision) a partire da una matrice
+di confusione 2×2. Il SÌ è convenuto come outcome positivo in tutti i
+calcoli.
+
+```{r metrics_function}
+calc_metrics <- function(cm) {
+  tp <- cm["si", "si"]
+  tn <- cm["no", "no"]
+  fp <- cm["si", "no"]
+  fn <- cm["no", "si"]
+
+  acc  <- (tp + tn) / sum(cm)
+  sens <- tp / (tp + fn)
+  spec <- tn / (tn + fp)
+  prec <- tp / (tp + fp)
+
+  data.frame(
+    Accuracy    = round(acc,  3),
+    Sensitivity = round(sens, 3),
+    Specificity = round(spec, 3),
+    Precision   = round(prec, 3)
+  )
+}
+```
+
+### 3.1.1 Verifica del Bilanciamento delle Classi
+
+```{r class_balance}
+cat("--- TRAINING SET ---\n")
+round(prop.table(table(dataset_train$SI_NO)) * 100, 1)
+
+cat("\n--- TEST SET ---\n")
+round(prop.table(table(dataset_test$SI_NO)) * 100, 1)
+```
+
+> **Verifica delle Proporzioni e Affidabilità dell'Accuracy**
+>
+> Come si evince dalle percentuali di classe appena calcolate, il
+> partizionamento dei dati ha generato una suddivisione statisticamente
+> solida in entrambi i set (circa 42-43% per il NO e 57-58% per il SÌ).
+> In primo luogo, questa coerenza percentuale conferma la perfetta
+> riuscita dello split, assicurando che ogni modello venga validato su
+> un campione fedele alla realtà su cui è stato addestrato. In secondo
+> luogo, le due classi si presentano **relativamente ben bilanciate**.
+> Questa evidenza empirica è vitale poiché risolve il problema della
+> mancanza di una baseline chiara (*Class Imbalance Problem*).
+
+------------------------------------------------------------------------
+
+## 3.2 Modello di Regressione Logistica
+
+Il punto di partenza è una regressione logistica con tutte le covariate
+disponibili. Il modello completo serve da benchmark: qualsiasi modello
+penalizzato che seguirà dovrà giustificare la propria parsimonia con
+performance almeno comparabili.
+
+```{r logistic_train}
+m1 <- glm(SI_NO ~ ., family = binomial, data = data)
+
+pred_prob_train  <- predict(m1, newdata = data, type = "response")
+pred_class_train <- ifelse(pred_prob_train > 0.5, "si", "no")
+
+cm_train_log <- table(predicted = pred_class_train, actual = data$SI_NO)
+print(cm_train_log)
+```
+
+```{r logistic_test}
+pred_prob_glm  <- predict(m1, newdata = test, type = "response")
+pred_class_glm <- ifelse(pred_prob_glm > 0.5, "si", "no")
+
+cm_test_log <- table(predicted = pred_class_glm, actual = test$SI_NO)
+print(cm_test_log)
+
+metrics_log <- calc_metrics(cm_test_log)
+```
+
+**Commento:** Sul test set la logistica completa raggiunge un'accuracy
+di `r metrics_log$Accuracy`, con sensitivity `r metrics_log$Sensitivity`
+e specificity `r metrics_log$Specificity`. Il gap contenuto rispetto al
+training esclude un overfitting marcato. Va però tenuto a mente che
+l'inclusione di tutte le covariate in presenza di multicollinearità (gli
+indici PCA sono ortogonali, ma le variabili di istruzione si
+sovrappongono) rende i singoli coefficienti instabili: il modello
+classifica bene ma non è detto che i pesi individuali siano
+interpretabili con fiducia.
+
+------------------------------------------------------------------------
+
+## 3.3 Modello LASSO Logistico
+
+### 3.3.1 Formulazione del problema
+
+La regressione logistica stima i coefficienti massimizzando la
+log-verosimiglianza $\ell(\boldsymbol{\beta})$. Quando le covariate sono
+molte o correlate, questo approccio produce stime ad alta varianza. Il
+**LASSO** (Tibshirani 1996) affronta il problema penalizzando la norma
+$\ell_1$ del vettore dei coefficienti:
+
+$$\hat{\boldsymbol{\beta}}_{\text{LASSO}} = \arg\max_{\boldsymbol{\beta}} \left[ \ell(\boldsymbol{\beta}) - \lambda \sum_{j=1}^{p} |\beta_j| \right]$$
+
+Il parametro $\lambda \geq 0$ controlla la forza della penalizzazione.
+La proprietà distintiva del LASSO rispetto alla penalizzazione Ridge
+($\ell_2$) è che la norma $\ell_1$ produce soluzioni sparse: al crescere
+di $\lambda$, un numero crescente di coefficienti viene portato
+esattamente a zero, realizzando di fatto una selezione automatica delle
+variabili.
+
+### 3.3.2 Stima e selezione di $\lambda$
+
+```{r lasso_model}
+library(glmnet)
+library(pROC)
+
+x_train <- model.matrix(SI_NO ~ ., data)[,-1]
+y_train  <- data$SI_NO
+
+x_test <- model.matrix(SI_NO ~ ., test)[,-1]
+y_test <- test$SI_NO
+
+cv_lasso <- cv.glmnet(
+  x            = x_train,
+  y            = y_train,
+  family       = "binomial",
+  nfolds       = 10,
+  type.measure = "class"
+)
+
+plot(cv_lasso)
+```
+
+Il grafico mostra l'errore di classificazione in cross-validation al
+variare di $\log(\lambda)$. Si considerano due punti di riferimento
+canonici:
+
+-   **`lambda.min`**: minimizza l'errore in CV modello più ricco ma
+    potenzialmente instabile.
+-   **`lambda.1se`**: il valore più restrittivo la cui performance in CV
+    non si discosta da `lambda.min` di più di una deviazione standard
+    modello più parsimonioso e con migliore generalizzazione attesa.
+
+Da questo punto si adotta **`lambda.1se`** come valore di riferimento.
+
+```{r lasso_test}
+pred_class_lasso_train <- predict(cv_lasso, newx = x_train, s = "lambda.1se", type = "class")
+table(predicted = pred_class_lasso_train, actual = y_train)
+
+pred_class_test <- predict(cv_lasso, newx = x_test, s = "lambda.1se", type = "class")
+cm_test_lasso   <- table(predicted = pred_class_test, actual = y_test)
+print(cm_test_lasso)
+
+metrics_lasso <- calc_metrics(cm_test_lasso)
+
+pred_prob_lasso <- as.vector(predict(cv_lasso, newx = x_test, s = "lambda.1se", type = "response"))
+roc_lasso       <- roc(response = y_test, predictor = pred_prob_lasso, quiet = TRUE)
+```
+
+```{r lasso_roc_plot, echo=FALSE, fig.dim=c(6,5)}
+plot(roc_lasso,
+     main = paste("Curva ROC - LASSO (AUC =", round(auc(roc_lasso), 3), ")"),
+     col  = "steelblue",
+     lwd  = 2)
+```
+
+**Commento:** Il LASSO con `lambda.1se` ottiene sul test set un'accuracy
+di `r metrics_lasso$Accuracy` e un AUC di `r round(auc(roc_lasso), 3)`
+sostanzialmente allineato alla logistica completa, ma con un numero
+molto inferiore di predittori attivi. È il tipico trade-off
+bias-varianza in azione: la penalizzazione introduce un piccolo bias nei
+coefficienti sopravvissuti, ma la riduzione della varianza compensa
+ampiamente in termini di stabilità predittiva out-of-sample.
+
+------------------------------------------------------------------------
+
+## 3.4 Relaxed LASSO
+
+### 3.4.1 Motivazione e formulazione
+
+Il LASSO ha un difetto strutturale: la penalità $\ell_1$, oltre a
+selezionare le variabili, *comprime* i coefficienti dei predittori che
+sopravvivono alla selezione. Questi predittori vengono stimati con un
+bias verso zero anche quando dovrebbero essere stimati liberamente. Se
+l'obiettivo è l'interpretazione dei coefficienti o la massimizzazione
+delle performance predittive questo bias di shrinkage è indesiderato.
+
+Il **Relaxed LASSO** (Meinshausen 2007) risolve il problema in due fasi.
+Sia $\hat{S}(\lambda)$ il sottoinsieme di predittori non nulli alla
+soluzione LASSO con parametro $\lambda$. Il modello rilassato risolve:
+
+$$\hat{\boldsymbol{\beta}}_{\text{relax}} = \arg\max_{\boldsymbol{\beta}} \left[ \ell(\boldsymbol{\beta}) - \gamma \lambda \sum_{j \in \hat{S}(\lambda)} |\beta_j| \right]$$
+
+dove $\gamma \in [0,1]$ controlla il grado di rilassamento:
+
+-   $\gamma = 1$: nessun rilassamento, equivale al LASSO standard.
+-   $\gamma = 0$: penalità completamente rimossa sui predittori
+    selezionati — equivalente a stimare una logistica pura sul
+    sottoinsieme $\hat{S}(\lambda)$ (Post-LASSO).
+-   $0 < \gamma < 1$: compromesso intermedio che riduce il bias
+    mantenendo una regolarizzazione residua.
+
+In `glmnet`, `relax = TRUE` esplora automaticamente la griglia di
+combinazioni $(\lambda, \gamma)$ tramite cross-validation.
+
+### 3.4.2 Stima
+
+```{r relaxed_lasso}
+cv_lasso_relaxed <- cv.glmnet(
+  x            = x_train,
+  y            = y_train,
+  family       = "binomial",
+  nfolds       = 10,
+  relax        = TRUE,
+  type.measure = "class"
+)
+
+gamma_opt <- cv_lasso_relaxed$relaxed$gamma.1se
+
+pred_class_test_relax <- predict(cv_lasso_relaxed,
+                                  newx  = x_test,
+                                  s     = "lambda.1se",
+                                  gamma = gamma_opt,
+                                  type  = "class")
+
+cm_test_relax <- table(predicted = pred_class_test_relax, actual = y_test)
+print(cm_test_relax)
+
+metrics_relax <- calc_metrics(cm_test_relax)
+```
+
+**Commento:** Il valore ottimale di $\gamma$ selezionato dalla CV è
+`r gamma_opt`. Un $\gamma < 1$ conferma che il rilassamento parziale è
+vantaggioso: la cross-validation premia modelli in cui i coefficienti
+sui predittori selezionati vengono lasciati "respirare" rispetto alla
+soluzione LASSO pura. Se $\gamma = 0$, il Relaxed LASSO coincide
+matematicamente col Post-LASSO della sezione successiva.
+
+------------------------------------------------------------------------
+
+## 3.5 Selezione delle Variabili con LASSO e Regressione Finale (Post-LASSO)
+
+L'ultimo modello parametrico adotta una strategia in due passi: prima si
+usa il LASSO per identificare il sottoinsieme di predittori rilevanti,
+poi si ri-stima una logistica classica senza penalizzazione su quel
+sottoinsieme. Questo elimina completamente il bias di shrinkage dai
+coefficienti finali, rendendo valida l'inferenza su di essi.
+
+```{r post_lasso}
+coef_lasso <- coef(cv_lasso, s = "lambda.1se")
+coef_lasso
+
+m_post <- glm(SI_NO ~ ALTA_ISTR + POSIZIONE_GEO + LOG_POPOLAZIONE,
+              family = binomial,
+              data   = data)
+
+pred_prob_post  <- predict(m_post, newdata = test, type = "response")
+pred_class_post <- ifelse(pred_prob_post > 0.5, "si", "no")
+
+cm_post <- table(predicted = pred_class_post, actual = test$SI_NO)
+print(cm_post)
+
+metrics_post <- calc_metrics(cm_post)
+```
+
+**Commento:** Il LASSO seleziona solo 3 predittori su 19 disponibili:
+`ALTA_ISTR`, `POSIZIONE_GEO` e `LOG_POPOLAZIONE`. La scelta è
+interpretabile: istruzione terziaria, collocazione geografica
+Nord/Centro/Sud e dimensione del comune sono le tre dimensioni
+strutturali che, da sole, riescono a catturare la maggior parte della
+variabilità nell'esito referendario. Il fatto che il modello finale con
+soli 3 predittori raggiunga un'accuracy di `r metrics_post$Accuracy`, la
+più alta tra i quattro modelli parametrici non è un caso: la parsimonia
+forza il modello a concentrarsi sul segnale vero, scartando i predittori
+che aggiungono rumore.
+
+------------------------------------------------------------------------
+
+## 3.6 Confronto Finale Tra i Modelli Parametrici
+
+```{r auc_calc, echo=FALSE}
+auc_log   <- round(auc(roc(test$SI_NO, as.vector(predict(m1, newdata = test, type = "response")), quiet = TRUE)), 3)
+auc_lasso <- round(auc(roc(y_test, pred_prob_lasso, quiet = TRUE)), 3)
+auc_relax <- round(auc(roc(y_test, as.vector(predict(cv_lasso_relaxed, newx = x_test, s = "lambda.1se", gamma = gamma_opt, type = "response")), quiet = TRUE)), 3)
+auc_post  <- round(auc(roc(test$SI_NO, as.vector(predict(m_post, newdata = test, type = "response")), quiet = TRUE)), 3)
+```
+
+```{r final_comparison, echo=FALSE}
+library(knitr)
+
+df_results <- rbind(
+  cbind(Modello = "Logistica Base",    metrics_log,   AUC = auc_log),
+  cbind(Modello = "LASSO (1se)",       metrics_lasso, AUC = auc_lasso),
+  cbind(Modello = "Relaxed LASSO",     metrics_relax, AUC = auc_relax),
+  cbind(Modello = "LASSO + Logistica", metrics_post,  AUC = auc_post)
+)
+
+kable(df_results,
+      row.names = FALSE,
+      align     = c("l", "c", "c", "c", "c", "c"),
+      caption   = "Metriche di performance sul Test Set")
+```
+
+### Quale modello scegliere?
+
+I quattro modelli producono performance molto simili in accuratezza
+(range 0.752–0.764) e AUC (range 0.815–0.822). Il segnale predittivo è
+concentrato in poche variabili e tutti i modelli lo intercettano. Le
+differenze rilevanti riguardano parsimonia e inferenza:
+
+-   La **Logistica Base** ottiene la seconda accuracy più alta (0.760) e
+    l'AUC più elevata (0.822), ma usa tutte le covariate disponibili. In
+    presenza di collinearità, i coefficienti individuali vanno
+    interpretati con cautela.
+
+-   Il **LASSO** riduce automaticamente i predittori attivi con perdita
+    minima di performance (accuracy 0.757, AUC 0.817). È la scelta
+    naturale quando il dataset è ampio e si vuole controllare
+    l'instabilità dei coefficienti.
+
+-   Il **Relaxed LASSO** introduce $\gamma$ per ridurre il bias di
+    shrinkage sui predittori selezionati. Le performance sono pressochè
+    equivalenti (accuracy 0.761, AUC 0.817), ma i coefficienti risultano
+    meno compressi.
+
+-   Il **LASSO + Logistica** raggiunge l'accuracy più alta (0.764) con
+    soli 3 predittori. Combina la selezione automatica del LASSO con la
+    stima non penalizzata della logistica: i coefficienti finali non
+    subiscono distorsione da shrinkage e l'inferenza su di essi è
+    valida. È la strategia preferibile quando si vogliono combinare
+    selezione delle variabili e rigore inferenziale sui parametri
+    stimati.
+
+------------------------------------------------------------------------
+
+# 4. Modelli Non Parametrici ed Ensemble
+
+```{r setup_nonparam, include=FALSE}
+train <- dataset_train
+test  <- dataset_test
+rownames(train) <- train[,2]
+rownames(test) <- test[,2]
+train$SI_NO <- as.factor(train$SI_NO)
+train$POSIZIONE_GEO <- as.factor(train$POSIZIONE_GEO)
+test$SI_NO <- as.factor(test$SI_NO)
+test$POSIZIONE_GEO <- as.factor(test$POSIZIONE_GEO)
+```
+
+## 4.1 Preparazione dei Dati
+
+Per questa fase vengono selezionate 12 variabili rappresentative del
+profilo demografico e socio-economico dei comuni, con la stessa
+suddivisione training/test già adottata. Rispetto alla fase parametrica,
+qui si reintroducono le variabili politiche storiche in alcuni modelli,
+con l'obiettivo esplicito di misurare il loro peso marginale rispetto
+alle sole variabili demografiche.
+
+```{r message=FALSE, warning=FALSE}
+library(tidyverse)
+
+trn <- train %>%
+  select(SI_NO, POSIZIONE_GEO, INDICE_POVERTA, INDICE_CETO_MEDIO, INDICE_DISUGUAGLIANZA, DENSITA_Xkmq,
+         PERC_STRANIERI, BASSA_ISTR, ALTA_ISTR, ETA_MEDIA, PERC_MASCHILE)
+
+tst_data <- test %>%
+  select(POSIZIONE_GEO, INDICE_POVERTA, INDICE_CETO_MEDIO, INDICE_DISUGUAGLIANZA, DENSITA_Xkmq,
+         PERC_STRANIERI, BASSA_ISTR, ALTA_ISTR, ETA_MEDIA, PERC_MASCHILE)
+tst_lable <- test$SI_NO
+```
+
+*(La funzione `calc_metrics` è già disponibile nell'ambiente
+dall'inizializzazione precedente; il chunk seguente la ridefinisce in
+background per compatibilità.)*
+
+```{r calc_metrics_nonparam, include=FALSE}
+calc_metrics <- function(cm) {
+  tp <- cm["si", "si"]
+  tn <- cm["no", "no"]
+  fp <- cm["si", "no"]
+  fn <- cm["no", "si"]
+  
+  acc <- (tp + tn) / sum(cm)
+  sens <- tp / (tp + fn)
+  spec <- tn / (tn + fp)
+  prec <- tp / (tp + fp)
+  
+  data.frame(
+    Accuracy = round(acc, 3), 
+    Sensitivity = round(sens, 3), 
+    Specificity = round(spec, 3), 
+    Precision = round(prec, 3)
+  )
+}
+```
+
+------------------------------------------------------------------------
+
+## 4.2 Decision Tree
+
+### 4.2.1 Albero decisionale con tutte le feature
+
+Il **Decision Tree** costruisce una gerarchia di regole di
+classificazione tramite partizione ricorsiva binaria dello spazio delle
+feature. Come *white-box model*, permette di leggere direttamente quali
+variabili guidano la classificazione ad ogni nodo, rendendo l'output
+interpretabile anche senza un background statistico. Il criterio di
+splitting adottato è l'**Indice di Gini** ($Gini = \sum p_k(1-p_k)$),
+che misura l'impurità del nodo e viene utilizzato per la divisione verso
+sottogruppi più omogenei.
+
+```{r message=FALSE, warning=FALSE}
+library(tree)
+albero <- tree(SI_NO ~ ., data = trn, split = "gini")
+summary(albero)
+```
+
+L'albero non potato genera 574 nodi terminali con un error rate in
+training del 12.73%. La complessità è insostenibile: il modello ha
+imparato a interpretare molto bene il training set, perdendo però la
+capacità di adattarsi a dei nuovi dati (andando dunque in overfitting) e
+qualsiasi utilità interpretativa. La potatura (*pruning*) è necessaria.
+
+```{r}
+cv_albero <- cv.tree(albero, FUN = prune.misclass)
+plot(cv_albero$size, cv_albero$dev, type = "b", xlim = c(0,30),
+     xlab = "Numero di Nodi Terminali (Size)", 
+     ylab = "Devianza (Misclassificazioni in CV)",
+     main = "Analisi per l'operazione di Pruning")
+```
+
+La devianza in cross-validation raggiunge il minimo con strutture molto
+compatte (2–4 nodi), per poi stabilizzarsi. Per bilanciare
+interpretabilità e capacità discriminativa, si fissa il limite a **4
+nodi terminali**.
+
+```{r}
+prune.albero <- prune.misclass(albero, best = 4)
+plot(prune.albero)
+text(prune.albero, pretty = 0)
+```
+
+La prima divisione all'radice è sulla **posizione geografica**. L'albero
+non usa neanche una variabile demografica al primo livello: il
+territorio conta più di qualsiasi indicatore di istruzione, reddito o
+densità. Da una parte c’è il Nord, dall’altra il Centro-Sud, con una
+divisione netta che riflette differenze strutturali nei sistemi politici
+locali. Al secondo livello, per la componente centrale, entra la densità
+abitativa: i comuni densamente popolati del Centro si avvicinano al
+comportamento meridionale (NO), mentre quelli meno densi mostrano un
+orientamento più sfumato.
+
+```{r}
+previsione <- predict(prune.albero, tst_data, type = "class")
+matrix_tree <- table(previsione, tst_lable)
+calc_metrics(matrix_tree) 
+```
+
+### 4.2.2 Albero decisionale escludendo la posizione geografica
+
+Rimosso il predittore geografico, si testa la capacità degli indicatori
+socio-demografici di lavorare in autonomia.
+
+*(Nota: da questa sezione si utilizza `rpart`, che svolge in autonomia
+cross-validation e pruning.)*
+
+```{r warning=FALSE, message=FALSE}
+library(rpart)
+library(rpart.plot)
+
+trn_no_pop <- train %>%
+  select(SI_NO, INDICE_POVERTA, INDICE_CETO_MEDIO, INDICE_DISUGUAGLIANZA, DENSITA_Xkmq,
+         PERC_STRANIERI, BASSA_ISTR, ALTA_ISTR, ETA_MEDIA, PERC_MASCHILE)
+
+tst_data_no_pop <- test %>%
+  select(INDICE_POVERTA, INDICE_CETO_MEDIO, INDICE_DISUGUAGLIANZA, DENSITA_Xkmq,
+         PERC_STRANIERI, BASSA_ISTR, ALTA_ISTR, ETA_MEDIA, PERC_MASCHILE)
+tst_lable_no_pop <- test$SI_NO
+
+albero_no_pop <- rpart(SI_NO ~ ., data = trn_no_pop)
+rpart.plot(albero_no_pop, main="Decision Tree omettendo l'area geografica")
+```
+
+> **Come leggere il grafico**: L'albero si legge dall'alto verso il
+> basso. Si parte dal nodo radice e si scende seguendo le condizioni: il
+> ramo *yes* va a sinistra quando la condizione è verificata, *no* va a
+> destra. Ogni rettangolo contiene tre informazioni. La **classe
+> predetta** (*sì*/*no*), la **proporzione** di casi che appartengono a
+> quella classe (più è vicina a 1, più la predizione è netta), e la
+> **percentuale** di osservazioni totali che arriva in quel nodo. Il
+> colore segnala la direzione e la certezza della predizione: il verde
+> indica *sì*, il blu indica *no*, e l'intensità cresce al crescere
+> della certezza. I toni intermedi corrispondono a nodi ancora incerti.
+
+```{r}
+previsione_no_pop <- predict(albero_no_pop, tst_data_no_pop, type = "class")
+matrix_no_pop <- table(previsione_no_pop, tst_lable_no_pop)
+calc_metrics(matrix_no_pop)
+```
+
+Senza il predittore geografico, l'accuracy crolla a circa 0.664. Il
+modello si affida a `PERC_STRANIERI` e ai tassi di istruzione, ma senza
+la frattura Nord/Centro-Sud come discriminante primaria non riesce a
+classificare in modo affidabile. Il risultato ha un significato chiaro:
+le variabili demografiche contano, ma sono strettamente legate alla
+geografia. Le stesse caratteristiche, come il livello di istruzione o
+l’immigrazione, che nel Nord si associano al SÌ, nel Sud si trovano in
+contesti in cui prevale il NO. Ignorare la geografia significa perdere
+la chiave che permette di capire davvero tutti gli altri fattori.
+
+### 4.2.3 Albero decisionale con Covariate Politiche Storiche
+
+Si reintroducono ora l'orientamento politico del 2022 (`PERC_SI_EL22`) e
+il risultato del Referendum Cittadinanza 2025 (`PERC_SI_CITTAD_REF25`).
+
+```{r}
+trn_pol <- train %>%
+  select(SI_NO, PERC_SI_EL22, PERC_SI_CITTAD_REF25, POSIZIONE_GEO, INDICE_POVERTA, INDICE_CETO_MEDIO, 
+         INDICE_DISUGUAGLIANZA, DENSITA_Xkmq, PERC_STRANIERI, BASSA_ISTR, ALTA_ISTR, ETA_MEDIA, PERC_MASCHILE)
+
+tst_data_pol <- test %>%
+  select(POSIZIONE_GEO, PERC_SI_EL22, PERC_SI_CITTAD_REF25, INDICE_POVERTA, INDICE_CETO_MEDIO, 
+         INDICE_DISUGUAGLIANZA, DENSITA_Xkmq, PERC_STRANIERI, BASSA_ISTR, ALTA_ISTR, ETA_MEDIA, PERC_MASCHILE)
+tst_lable_pol <- test$SI_NO
+
+albero_pol <- rpart(SI_NO ~ ., data = trn_pol)
+rpart.plot(albero_pol, main="Albero decisionale integrato a covariate politiche")
+```
+
+```{r}
+previsione_pol <- predict(albero_pol, tst_data_pol, type = "class")
+matrix_pol <- table(previsione_pol, tst_lable_pol)
+calc_metrics(matrix_pol)
+```
+
+L'orientamento storico `PERC_SI_EL22` assorbe quasi tutto il peso
+predittivo: l'albero si riduce essenzialmente a una singola regola
+binaria "il comune avrebbe votato SÌ nel 2022?" e quasi tutto il resto
+scompare. Il risultato è coerente con quanto già emerso dalla matrice di
+correlazione e dal quadrante politico: il referendum 2026 è in larga
+misura un'eco del voto politico pregresso. Le variabili demografiche non
+aggiungono molto, una volta noto l'orientamento elettorale di partenza.
+
+------------------------------------------------------------------------
+
+## 4.3 Random Forest
+
+Il **Random Forest** è un algoritmo di Ensemble Learning che costruisce
+una molteplicità di alberi decisionali (`ntree = 500`) e li fa votare
+collettivamente sulla classificazione. La forza dell'approccio deriva da
+due meccanismi di stocasticità introdotti in fase di addestramento:
+
+1.  **Bagging** (Bootstrap Aggregating): ogni albero viene addestrato su
+    un campione estratto con reimmissione dal dataset originale. Questo
+    garantisce che i 500 alberi siano tra loro diversificati.
+2.  **Feature Subsampling**: ad ogni divisione di un nodo, si valutano
+    solo $\sqrt{p}$ predittori scelti casualmente, impedendo a qualsiasi
+    variabile dominante di monopolizzare la struttura di tutti gli
+    alberi.
+
+Il meccanismo combinato sopprime fortemente l'overfitting rispetto al
+singolo albero, al costo però dell'interpretabilità: non esiste un
+diagramma leggibile come quello dell'albero potato.Il Random Forest è un
+modello difficile da interpretare, una sorta di “scatola nera” che però
+riesce a classificare bene. La sezione XAI che segue serve proprio a
+rendere più chiaro come funziona.
+
+```{r message=FALSE, warning=FALSE}
+library(randomForest)
+
+p <- ncol(trn) - 1          
+mtry_default <- floor(sqrt(p))
+
+randomf <- randomForest(
+  formula    = SI_NO ~ .,
+  data       = trn,
+  mtry       = mtry_default,
+  ntree      = 500,
+  importance = TRUE
+)
+randomf
+```
+L'utilizzo di più alberi decisionali combinati tra loro, consente di ridurre il rischio di overfitting rispettoall'impiego di un singolo albero.
+Questo miglioramento delle prestazioni avviene però a scapito dell'interpretabilità: il modello risulta infatti più complesso e meno immediato da interpretare. Prima di procedere con tecniche di interpretabilità (XAI), è quindi opportuno verificare che il modello abbia effettivamente appreso informazioni utili dai dati. A questo scopo si utilizza l'errore Out-of-Bag (OOB).
+
+Il funzionamento è semplice: poiché ogni albero viene addestrato su un
+campione casuale dei dati (bootstrapping), le osservazioni che non vengono
+selezionate in quel campione restano fuori, "Out-of-Bag" appunto. Il modello
+le usa come test set naturale per stimare l'errore senza bisogno di
+separare i dati in anticipo. Il risultato è una misura di accuratezza
+interna e imparziale.
+
+Nel grafico seguente l'asse X indica il numero di alberi, l'asse Y il tasso
+di errore. La linea nera riporta l'errore medio complessivo, quelle colorate
+l'errore per singola classe. Quando le curve si stabilizzano in un plateau,
+il modello ha raggiunto la convergenza: aggiungere altri alberi non
+migliorerebbe la precisione, ma solo il tempo di calcolo.
+
+```{r}
+plot(randomf, main = 'Random Forest: Errore OOB contro iterazioni')
+legend("topright", 
+       legend = c("OOB Totale", "Voto_no", "Voto_si"), 
+       col = c("black", "red", "green"), 
+       lty = 1:3, 
+       cex = 0.8)
+```
+
+Il grafico mostra come l'errore OOB (*Out-of-Bag Error Rate*) evolve al
+crescere del numero di alberi. Tutte e tre le curve, ovvero l'errore medio
+complessivo (linea nera), quello per i comuni che hanno votato *no*
+(Voto_no, rossa) e quello per i comuni che hanno votato *sì* (Voto_si,
+verde), scendono rapidamente nei primi 100 alberi e si stabilizzano
+intorno ai 150, confermando che 500 alberi sono ampiamente sufficienti.
+Il modello predice meglio i comuni del *sì*, con un errore che si assesta
+intorno al 15%, mentre per i comuni del *no* rimane più alto, attorno al
+33%: la classe negativa risulta strutturalmente più difficile da predire.
+
+```{r}
+pred_rf <- predict(randomf, newdata = tst_data, type = 'class')
+matrix_rf <- table(pred_rf, tst_lable)
+calc_metrics(matrix_rf)
+```
+
+Il Random Forest supera tutti i modelli precedenti in accuracy. Il
+guadagno rispetto all'albero singolo è sostanziale.
+
+```{r}
+varImpPlot(randomf, main = 'Metriche di Importanza delle Variabili (RF)')
+```
+
+Il Variable Importance plot mostra, per ciascuna variabile, quanto essa
+contribuisce alle predizioni del modello; misurato secondo due criteri
+complementari: la riduzione media dell'accuratezza
+(*MeanDecreaseAccuracy*) e la riduzione media dell'impurità di Gini
+(*MeanDecreaseGini*). Le variabili sono ordinate dall'alto verso il
+basso in senso decrescente di importanza.
+
+**POSIZIONE_GEO** risulta di gran lunga il predittore più rilevante
+secondo entrambe le metriche, con un distacco netto rispetto a tutte le
+altre variabili. Questo indica che la collocazione geografica del comune
+è il fattore che, più di ogni altro, permette al modello di separare
+correttamente le due classi.
+
+Nelle posizioni intermedie si trovano gli indicatori di istruzione
+(**ALTA_ISTR**, **BASSA_ISTR**) e la quota di stranieri residenti
+(**PERC_STRANIERI**), che contribuiscono in misura minore ma non
+trascurabile. In fondo alla graduatoria compaiono **PERC_MASCHILE** ed
+**ETA_MEDIA**, il cui contributo appare marginale nell'economia
+complessiva del modello.
+
+Il fatto che le due metriche producano un ranking sostanzialmente
+coincidente rafforza la robustezza di questi risultati: la gerarchia
+delle variabili non dipende dal criterio scelto, ma riflette una
+struttura reale nei dati.
+
+------------------------------------------------------------------------
+
+## 4.4 XAI e il Modello Surrogato
+
+Quando le performance di un modello black-box sono troppo buone per
+essere abbandonate, ma la spiegabilità è un requisito, comunicativo o
+interpretativo si ricorre all'**XAI** (*eXplainable Artificial
+Intelligence*). Questa branca offre tecniche per ricostruire, almeno
+parzialmente, la logica decisionale di modelli complessi.
+
+Il metodo qui adottato è il **Modello Surrogato Globale**: si addestra
+un modello semplice e interpretabile (un albero `rpart`) non per
+prevedere l'esito referendario reale, ma per *imitare* le previsioni
+prodotte dalla Random Forest. Il surrogato non vede mai la ground truth
+la sua variabile risposta è l'output della foresta. Se il surrogato
+riesce ad approssimare bene le decisioni della Random Forest con poche
+regole leggibili, quelle regole possono essere usate come proxy delle
+scelte della foresta stessa.
+
+```{r}
+library(rpart)
+library(rpart.plot)
+
+dati_surrogato <- tst_data
+dati_surrogato$SI_NO <- NULL 
+dati_surrogato$PREVISIONE_RF <- pred_rf 
+```
+
+```{r}
+albero_surrogato <- rpart(PREVISIONE_RF ~ ., data = dati_surrogato, method = "class")
+
+rpart.plot(albero_surrogato, type = 4, extra = 104, box.palette = "RdYlGn", 
+           shadow.col = "gray", nn = TRUE, 
+           main = "Albero Surrogato - Estrazione Regole da RF")
+```
+
+> **Nota**: L'albero surrogato è una rappresentazione ad albero di
+> decisione addestrata non sui dati originali, ma sulle *predizioni* del
+> Random Forest. Ogni nodo interno contiene la variabile e la soglia
+> usate per dividere le osservazioni, mentre ogni nodo foglia riporta
+> tre informazioni: la classe predetta (*sì* o *no*), la distribuzione
+> di probabilità tra le due classi (es. `.05 .95`) e la percentuale di
+> osservazioni del campione che ricade in quel nodo. Il colore del
+> riquadro riflette la classe dominante: verde per *sì*, rosso per *no*,
+> giallo/arancio per nodi ancora incerti. L'albero si legge dall'alto
+> verso il basso seguendo i rami: a sinistra si va quando la condizione
+> del nodo è verificata, a destra quando non lo è.
+
+L'albero surrogato riproduce in modo abbastanza fedele il comportamento
+del Random Forest e permette di capire quali variabili guidano le
+decisioni. Alla radice compare **POSIZIONE_GEO**, a indicare che la
+dimensione territoriale è il fattore più rilevante.
+
+I comuni del **Sud** vengono separati subito, con una probabilità di
+risposta negativa pari al 93% e il 33% delle osservazioni totali che
+finisce in questo nodo. Si tratta del gruppo più numeroso e più netto
+dell'intero albero. I comuni del **Centro** e del **Nord** seguono
+invece percorsi più articolati, dove entrano in gioco altre variabili.
+
+Nel ramo del **Centro** il secondo fattore rilevante è la densità
+abitativa (**DENSITA_Xkmq**). I comuni con densità superiore a 0.012
+abitanti per chilometro quadrato mostrano una probabilità di risposta
+positiva dell'80%, mentre quelli al di sotto di quella soglia tendono al
+negativo (78% di *no*). La densità sembra quindi amplificare o smorzare
+l'effetto della posizione geografica: vivere in un comune centrale ma
+poco popolato non è sufficiente a garantire una risposta positiva.
+
+Nel ramo del **Nord** il ruolo principale è giocato dal livello di
+istruzione. I comuni con **ALTA_ISTR** superiore a 0.43 entrano in un
+nodo ancora incerto (47% *sì*, 53% *no*), che si risolve poi grazie a
+**BASSA_ISTR**: dove la quota di bassa istruzione scende sotto 0.25 la
+probabilità di *no* sale all'81%, mentre dove rimane sopra quella soglia
+la probabilità di *sì* raggiunge il 79%. Il nodo terminale più netto di
+tutto l'albero si trova però nel ramo opposto: i comuni del Nord con
+**ALTA_ISTR** inferiore a 0.43 ottengono il 98% di *sì* e coprono il 51%
+delle osservazioni totali. Questo significa che la maggioranza dei
+comuni nordici si concentra in un gruppo molto omogeneo e ben
+identificabile.
+
+Nel complesso emerge una struttura interpretabile: prima conta la
+geografia, poi entrano in gioco le caratteristiche sociodemografiche del
+territorio. Va comunque tenuto presente che si tratta di una
+semplificazione: l'albero rende leggibile il modello, ma non cattura
+tutte le relazioni più complesse che la foresta originale è in grado di
+apprendere.
+
+------------------------------------------------------------------------
+
+# 5. Conclusioni
+
+Il progetto ha messo alla prova un ventaglio di tecniche di
+classificazione su un problema reale e non banale: prevedere l'esito del
+referendum 2026 a livello comunale a partire da caratteristiche
+strutturali del territorio.
+
+Il risultato che emerge con più forza è la **centralità della
+geografia**. La variabile `POSIZIONE_GEO` domina tutti i modelli,
+parametrici e non parametrici, senza le variabili politiche storiche.
+Non si tratta di un artefatto tecnico: riflette una realtà ben
+documentata nella letteratura sul comportamento di voto italiano, dove
+Nord e Sud mantengono orientamenti politici strutturalmente divergenti
+che nessuna variabile demografica riesce a spiegare completamente in
+autonomia.
+
+```{r mappa_esito_finale, message=FALSE, warning=FALSE, out.width="100%", fig.cap="Geografia dell'esito elettorale pesato per popolazione residente", echo=FALSE}
+
+italia_sf <- st_union(mappa_comuni)
+
+mappa_dati_pulita <- mappa_dati %>%
+  mutate(
+    PERC_SI_EL22 = round(PERC_SI_EL22 * 100, 1),
+    PERC_SI = round(PERC_SI * 100, 1),
+    ETA_MEDIA = round(ETA_MEDIA, 1) 
+  ) %>%
+  select(Nome_Match,POPOLAZIONE, PERC_SI_EL22, ETA_MEDIA, PERC_SI, SI_NO) 
+
+
+mappa_centri_gg <- st_centroid(mappa_dati_pulita) %>%
+  filter(!is.na(SI_NO)) %>%    
+  arrange(POPOLAZIONE)   
+
+ggplot() +
+  
+  geom_sf(data = italia_sf, fill = "#f5f5f5", color = "darkgray", linewidth = 0.3) + 
+  
+  geom_sf(data = mappa_centri_gg, aes(color = as.factor(SI_NO), size = POPOLAZIONE), alpha = 0.75) +
+  
+  scale_color_manual(
+    values = c("#85C1E9","#F1948A"), 
+    labels = c("Vittoria NO", "Vittoria SÌ")
+  ) +
+  scale_size_area(max_size = 10, guide = "none") + 
+  
+  theme_void() + 
+  labs(
+    title = "Esito Assoluto del Referendum",
+    color = ""
+  ) +
+  theme(legend.position = "bottom",
+        legend.title = element_blank())
+```
+
+Il grafico in mappa sintetizza visivamente un interessante paradosso
+sociopolitico: sebbene il fronte del **SÌ** abbia inequivocabilmente
+trionfato nel numero assoluto di comuni sul tabellone , ha subìto una
+sconfitta nel numero reale di schede votanti finali. Il motivo è nel
+contrasto tra espansione territoriale e calibro demografico: la
+prevalenza del SÌ è frammentata e dispersa in migliaia di plessi
+comunali demograficamente irrilevanti o minuscoli.
+
+Il secondo risultato rilevante riguarda il **peso dell'inerzia
+elettorale**. Quando si include `PERC_SI_EL22`, il voto politico del
+2022 assorbe quasi tutto il segnale predittivo, relegando le variabili
+demografiche a un ruolo marginale. Il referendum 2026 è stato, in larga
+misura, un referendum sull'identità politica preesistente non una
+valutazione autonoma del merito della riforma.
+
+Sul fronte metodologico, il confronto tra i modelli parametrici mostra
+che la parsimonia premia. Il Post-LASSO con 3 soli predittori raggiunge
+l'accuracy più alta tra i modelli lineari, a conferma che il segnale
+predittivo è concentrato e le variabili marginali aggiungono rumore. Tra
+i metodi non parametrici, la Random Forest offre le performance
+migliori, ma richiede il surrogato XAI per essere decifrata: un costo
+metodologico da considerare quando l'interpretabilità è prioritaria.
+
+In sintesi, il quadro che emerge è coerente: l'Italia vota seguendo
+linee geografiche e storiche profonde, che i modelli demografici
+riescono a catturare ma solo parzialmente, e sempre con l'ombra della
+posizione sul territorio come variabile di contesto dominante.
+
+# 6. References
+
+James, G., Witten, D., Hastie, T. & Tibshirani, R. (2021). *An Introduction to Statistical Learning: with Applications in R*. Springer Texts in Statistics. Springer, 2nd ed.
+
+Meinshausen, N. (2007). Relaxed Lasso. *Computational Statistics & Data Analysis*, 52(1), 374–393.
